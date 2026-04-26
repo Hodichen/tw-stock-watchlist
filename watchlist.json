@@ -1,0 +1,18 @@
+{
+  "stocks": [
+    {"id": "6849", "name": "奇鼎", "note": "庫存"},
+    {"id": "2303", "name": "聯電", "note": "庫存"},
+    {"id": "4573", "name": "高明鐵", "note": "庫存"},
+    {"id": "7731", "name": "火星生技", "note": "興櫃 - 庫存"},
+    {"id": "00981A", "name": "主動統一台股增長", "note": "ETF - 庫存"}
+  ],
+  "settings": {
+    "default_lookback_days": 180,
+    "alert_thresholds": {
+      "rsi_high": 80,
+      "rsi_low": 30,
+      "kd_high": 80,
+      "kd_low": 20
+    }
+  }
+}
