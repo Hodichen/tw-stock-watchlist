@@ -1,587 +1,406 @@
 # -*- coding: utf-8 -*-
-"""
-台股觀察清單分析網站
-作者: Hodichen
-功能: 自動抓取觀察股票的技術面、籌碼面、基本面數據，
-      並提供綜合警示與評分系統
-技術指標套件: ta (FinMind 內建依賴，最穩定)
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import SMAIndicator, MACD
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from FinMind.data import DataLoader
-import json
-import time
-import io
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# ============================================
-# 頁面設定
-# ============================================
-st.set_page_config(
-    page_title="台股觀察清單",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="台股個股分析", page_icon="📊", layout="wide")
 
 st.markdown("""
 <style>
-    .main { padding-top: 1rem; }
-    .alert-red {background:#4a1a1a;color:#ff6b6b;padding:4px 10px;border-radius:12px;display:inline-block;margin:2px;font-size:12px;font-weight:500;}
-    .alert-yellow {background:#4a3a1a;color:#ffd93d;padding:4px 10px;border-radius:12px;display:inline-block;margin:2px;font-size:12px;font-weight:500;}
-    .alert-green {background:#1a4a2a;color:#6bcf7f;padding:4px 10px;border-radius:12px;display:inline-block;margin:2px;font-size:12px;font-weight:500;}
-    .status-card {background:#1e1e1e;padding:16px;border-radius:8px;border:1px solid #333;}
+.alert-red {background:#4a1a1a;color:#ff6b6b;padding:4px 10px;border-radius:12px;display:inline-block;margin:2px;font-size:13px;}
+.alert-yellow {background:#4a3a1a;color:#ffd93d;padding:4px 10px;border-radius:12px;display:inline-block;margin:2px;font-size:13px;}
+.alert-green {background:#1a4a2a;color:#6bcf7f;padding:4px 10px;border-radius:12px;display:inline-block;margin:2px;font-size:13px;}
+.metric-box {background:#1e1e1e;padding:14px;border-radius:8px;border:1px solid #333;text-align:center;}
 </style>
 """, unsafe_allow_html=True)
 
 
 @st.cache_resource
-def get_data_loader():
-    try:
-        token = st.secrets["FINMIND_TOKEN"]
-        dl = DataLoader()
-        dl.login_by_token(api_token=token)
-        return dl
-    except Exception as e:
-        st.error(f"❌ FinMind 登入失敗：{e}")
-        st.stop()
+def get_dl():
+    token = st.secrets["FINMIND_TOKEN"]
+    dl = DataLoader()
+    dl.login_by_token(api_token=token)
+    return dl
 
-dl = get_data_loader()
-
-WATCHLIST_FILE = "watchlist.json"
-
-def load_watchlist():
-    try:
-        with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {"stocks": [], "settings": {}}
+dl = get_dl()
 
 
-def safe_get(series, idx=-1):
+# ── 技術指標（純 pandas，零外部依賴）──
+def sma(s, n): return s.rolling(n, min_periods=1).mean()
+
+def rsi(s, n=14):
+    d = s.diff()
+    g = d.where(d > 0, 0).ewm(com=n-1, min_periods=n).mean()
+    l = (-d.where(d < 0, 0)).ewm(com=n-1, min_periods=n).mean()
+    return 100 - 100 / (1 + g / l)
+
+def macd(s, f=12, sl=26, sig=9):
+    m = s.ewm(span=f, adjust=False).mean() - s.ewm(span=sl, adjust=False).mean()
+    signal = m.ewm(span=sig, adjust=False).mean()
+    return m, signal, m - signal
+
+def kd(hi, lo, cl, kp=9, dp=3):
+    ll = lo.rolling(kp, min_periods=1).min()
+    hh = hi.rolling(kp, min_periods=1).max()
+    rsv = 100 * (cl - ll) / (hh - ll).replace(0, np.nan).fillna(50)
+    k = rsv.ewm(com=dp-1, adjust=False).mean()
+    d = k.ewm(com=dp-1, adjust=False).mean()
+    return k, d
+
+def safe(series, idx=-1):
     try:
         v = series.iloc[idx]
-        if pd.isna(v):
-            return None
-        return float(v)
-    except Exception:
-        return None
+        return float(v) if pd.notna(v) else None
+    except: return None
 
 
-def calc_indicators(df):
-    df['MA5'] = SMAIndicator(close=df['close'], window=5).sma_indicator()
-    df['MA20'] = SMAIndicator(close=df['close'], window=20).sma_indicator()
-    df['MA60'] = SMAIndicator(close=df['close'], window=60).sma_indicator()
-    df['RSI14'] = RSIIndicator(close=df['close'], window=14).rsi()
-
-    macd = MACD(close=df['close'], window_slow=26, window_fast=12, window_sign=9)
-    df['MACD'] = macd.macd()
-    df['MACD_signal'] = macd.macd_signal()
-    df['MACD_hist'] = macd.macd_diff()
-
-    stoch = StochasticOscillator(high=df['high'], low=df['low'], close=df['close'],
-                                 window=9, smooth_window=3)
-    df['K'] = stoch.stoch()
-    df['D'] = stoch.stoch_signal()
-
-    df['Volume_MA5'] = SMAIndicator(close=df['volume'], window=5).sma_indicator()
-    df['Volume_Ratio'] = df['volume'] / df['Volume_MA5']
-    df['Change_Pct'] = df['close'].pct_change() * 100
-    return df
-
-
-@st.cache_data(ttl=3600)
-def analyze_stock(stock_id, lookback_days=180):
-    end_date = pd.Timestamp.today().strftime("%Y-%m-%d")
-    start_date = (pd.Timestamp.today() - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+# ── 主分析函式 ──
+@st.cache_data(ttl=1800, show_spinner=False)
+def analyze(stock_id):
+    end = pd.Timestamp.today().strftime("%Y-%m-%d")
+    start = (pd.Timestamp.today() - pd.Timedelta(days=200)).strftime("%Y-%m-%d")
     is_etf = stock_id.startswith("00") and len(stock_id) >= 5
 
+    # 股價
+    df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start, end_date=end)
+    if df.empty:
+        return None, "無股價資料"
+
+    df = df.rename(columns={"max":"high","min":"low","Trading_Volume":"volume"})
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # 股名
     try:
-        df = dl.taiwan_stock_daily(stock_id=stock_id, start_date=start_date, end_date=end_date)
-        if df.empty:
-            return {"股票代號": stock_id, "錯誤": "無股價資料"}
+        info = dl.taiwan_stock_info()
+        m = info[info["stock_id"]==stock_id]
+        name = m["stock_name"].iloc[0] if not m.empty else stock_id
+    except: name = stock_id
 
-        df = df.rename(columns={"max": "high", "min": "low", "Trading_Volume": "volume"})
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").reset_index(drop=True)
+    # 技術指標
+    df["MA5"]  = sma(df["close"], 5)
+    df["MA20"] = sma(df["close"], 20)
+    df["MA60"] = sma(df["close"], 60)
+    df["RSI"]  = rsi(df["close"])
+    df["MACD"], df["MACD_sig"], df["MACD_hist"] = macd(df["close"])
+    df["K"], df["D"] = kd(df["high"], df["low"], df["close"])
+    df["VMA5"]  = sma(df["volume"], 5)
+    df["VRatio"] = df["volume"] / df["VMA5"]
+    df["Chg%"]   = df["close"].pct_change() * 100
 
+    lat = df.iloc[-1]
+    rsi_v  = safe(df["RSI"])
+    k_v    = safe(df["K"])
+    d_v    = safe(df["D"])
+    ma5_v  = safe(df["MA5"])
+    ma20_v = safe(df["MA20"])
+    ma60_v = safe(df["MA60"])
+    cl_v   = safe(df["close"])
+    vr_v   = safe(df["VRatio"])
+    chg    = safe(df["Chg%"]) or 0
+
+    # 法人
+    i_start = (df["date"].max() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    pivot = pd.DataFrame()
+    try:
+        inst = dl.taiwan_stock_institutional_investors(
+            stock_id=stock_id, start_date=i_start, end_date=end)
+        if not inst.empty:
+            inst["net"] = inst["buy"] - inst["sell"]
+            def cls(n):
+                if n in ["Foreign_Investor","Foreign_Dealer_Self"]: return "外資"
+                if n == "Investment_Trust": return "投信"
+                if n in ["Dealer_self","Dealer_Hedging"]: return "自營商"
+                return "其他"
+            inst["類別"] = inst["name"].apply(cls)
+            p = inst.pivot_table(index="date",columns="類別",values="net",aggfunc="sum").fillna(0)
+            for c in ["外資","投信","自營商"]:
+                if c not in p.columns: p[c] = 0
+            p["合計"] = p["外資"] + p["投信"] + p["自營商"]
+            pivot = (p[["外資","投信","自營商","合計"]] / 1000).round().astype(int)
+            pivot.index = pd.to_datetime(pivot.index)
+            pivot = pivot.sort_index(ascending=False)
+    except: pass
+
+    def consec(s):
+        if s.empty: return 0, "中性"
+        v0 = s.iloc[0]
+        if v0 == 0: return 0, "中性"
+        dir_ = "買超" if v0 > 0 else "賣超"
+        cnt = sum(1 for v in s if (v > 0) == (dir_ == "買超"))
+        return cnt, dir_
+
+    if not pivot.empty:
+        fd, fdir = consec(pivot["外資"])
+        itot = int(pivot["合計"].iloc[0])
+        ifor = int(pivot["外資"].iloc[0])
+        itru = int(pivot["投信"].iloc[0])
+        idal = int(pivot["自營商"].iloc[0])
+    else:
+        fd, fdir, itot, ifor, itru, idal = 0, "中性", 0, 0, 0, 0
+
+    # 月營收
+    yoy = mom = rev = 0
+    has_rev = False
+    if not is_etf:
         try:
-            info = dl.taiwan_stock_info()
-            match = info[info["stock_id"] == stock_id]
-            stock_name = match["stock_name"].iloc[0] if not match.empty else stock_id
-        except Exception:
-            stock_name = stock_id
+            r_start = (df["date"].max() - pd.Timedelta(days=550)).strftime("%Y-%m-%d")
+            rv = dl.taiwan_stock_month_revenue(stock_id=stock_id, start_date=r_start, end_date=end)
+            if not rv.empty:
+                rv["date"] = pd.to_datetime(rv["date"])
+                rv = rv.sort_values("date").reset_index(drop=True)
+                rv["MoM"] = rv["revenue"].pct_change(1)*100
+                rv["YoY"] = rv["revenue"].pct_change(12)*100
+                lr = rv.iloc[-1]
+                yoy = float(lr["YoY"]) if pd.notna(lr["YoY"]) else 0
+                mom = float(lr["MoM"]) if pd.notna(lr["MoM"]) else 0
+                rev = float(lr["revenue"]) / 1e8
+                has_rev = True
+        except: pass
 
-        df = calc_indicators(df)
-        latest = df.iloc[-1]
+    # 警示
+    alerts = {"red":[], "yellow":[], "green":[]}
+    if rsi_v:
+        if rsi_v > 80: alerts["red"].append("RSI 嚴重超買")
+        elif rsi_v > 70: alerts["yellow"].append("RSI 接近超買")
+        elif rsi_v < 30: alerts["green"].append("RSI 超賣可能反彈")
+    if k_v and d_v:
+        if k_v > 80 and d_v > 80: alerts["red"].append("KD 高檔鈍化")
+        elif k_v < 20 and d_v < 20: alerts["green"].append("KD 低檔鈍化")
+        if len(df) >= 2:
+            pk, pd_ = safe(df["K"],-2), safe(df["D"],-2)
+            if pk and pd_:
+                if k_v < d_v and pk > pd_: alerts["red"].append("KD 死叉")
+                elif k_v > d_v and pk < pd_: alerts["green"].append("KD 黃金交叉")
+    if all(v is not None for v in [ma5_v, ma20_v, ma60_v, cl_v]):
+        if cl_v > ma5_v > ma20_v > ma60_v: alerts["green"].append("均線多頭排列")
+        elif cl_v < ma5_v < ma20_v < ma60_v: alerts["red"].append("均線空頭排列")
+    if vr_v:
+        if vr_v > 2: alerts["yellow"].append(f"爆量 ({vr_v:.1f}x)")
+        elif vr_v < 0.5: alerts["yellow"].append("量縮警示")
+    if chg > 0 and itot < 0: alerts["red"].append("籌碼背離")
+    elif chg < 0 and itot > 0: alerts["green"].append("法人逆勢買進")
+    if fd >= 3:
+        (alerts["green"] if fdir=="買超" else alerts["red"]).append(f"外資連{fd}{fdir}")
+    if has_rev:
+        if yoy > 30: alerts["green"].append(f"營收YoY +{yoy:.0f}%")
+        elif yoy > 10: alerts["green"].append(f"營收YoY +{yoy:.0f}%")
+        elif yoy < -10: alerts["red"].append(f"營收YoY {yoy:.0f}%")
 
-        inst_start = (df["date"].max() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
-        inst_end = df["date"].max().strftime("%Y-%m-%d")
-        pivot = pd.DataFrame()
-        try:
-            inst = dl.taiwan_stock_institutional_investors(
-                stock_id=stock_id, start_date=inst_start, end_date=inst_end
-            )
-            if not inst.empty:
-                inst["net"] = inst["buy"] - inst["sell"]
-                def classify(name):
-                    if name in ["Foreign_Investor", "Foreign_Dealer_Self"]: return "外資"
-                    elif name == "Investment_Trust": return "投信"
-                    elif name in ["Dealer_self", "Dealer_Hedging"]: return "自營商"
-                    return "其他"
-                inst["類別"] = inst["name"].apply(classify)
-                pivot = inst.pivot_table(index="date", columns="類別", values="net", aggfunc="sum").fillna(0)
-                for col in ["外資", "投信", "自營商"]:
-                    if col not in pivot.columns:
-                        pivot[col] = 0
-                pivot["合計"] = pivot["外資"] + pivot["投信"] + pivot["自營商"]
-                pivot = pivot[["外資", "投信", "自營商", "合計"]]
-                pivot = (pivot / 1000).round().astype(int)
-                pivot.index = pd.to_datetime(pivot.index)
-                pivot = pivot.sort_index(ascending=False)
-        except Exception:
-            pass
+    # 評分
+    ts = 3
+    if rsi_v:
+        if rsi_v > 80 or (k_v and d_v and k_v > 80 and d_v > 80): ts = 5
+        elif rsi_v > 70: ts = 4
+        elif cl_v and ma5_v and ma20_v and cl_v > ma5_v > ma20_v: ts = 4
+        elif cl_v and ma20_v and cl_v < ma20_v: ts = 2
+    cs = 3
+    if chg > 0 and itot < 0: cs = 2
+    elif fd >= 3 and fdir == "買超": cs = 5
+    elif fd >= 3 and fdir == "賣超": cs = 2
+    elif itot > 0: cs = 4
+    fs = 3
+    if has_rev:
+        if yoy > 30: fs = 5
+        elif yoy > 10: fs = 4
+        elif yoy < 0: fs = 2
+        elif yoy < -10: fs = 1
 
-        def consecutive_count(series):
-            if len(series) == 0: return 0, "中性"
-            latest_v = series.iloc[0]
-            if latest_v == 0: return 0, "中性"
-            direction = "買超" if latest_v > 0 else "賣超"
-            count = 0
-            for v in series:
-                if (v > 0 and direction == "買超") or (v < 0 and direction == "賣超"):
-                    count += 1
-                else:
-                    break
-            return count, direction
+    nr = len(alerts["red"])
+    ng = len(alerts["green"])
+    status = "🔴 過熱" if nr >= 2 else "🟡 觀察" if nr >= 1 else "🟢 健康" if ng >= 2 else "⚪ 中性"
 
-        if not pivot.empty:
-            foreign_days, foreign_dir = consecutive_count(pivot["外資"])
-            latest_inst_total = int(pivot["合計"].iloc[0])
-            latest_foreign = int(pivot["外資"].iloc[0])
-            latest_trust = int(pivot["投信"].iloc[0])
-            latest_dealer = int(pivot["自營商"].iloc[0])
-        else:
-            foreign_days, foreign_dir = 0, "中性"
-            latest_inst_total = latest_foreign = latest_trust = latest_dealer = 0
-
-        latest_yoy = latest_mom = latest_revenue = 0
-        has_revenue = False
-        if not is_etf:
-            try:
-                rev_start = (df["date"].max() - pd.Timedelta(days=550)).strftime("%Y-%m-%d")
-                revenue = dl.taiwan_stock_month_revenue(
-                    stock_id=stock_id, start_date=rev_start, end_date=end_date
-                )
-                if not revenue.empty:
-                    revenue["date"] = pd.to_datetime(revenue["date"])
-                    revenue = revenue.sort_values("date").reset_index(drop=True)
-                    revenue["MoM_%"] = revenue["revenue"].pct_change(periods=1) * 100
-                    revenue["YoY_%"] = revenue["revenue"].pct_change(periods=12) * 100
-                    latest_rev = revenue.iloc[-1]
-                    latest_yoy = float(latest_rev["YoY_%"]) if pd.notna(latest_rev["YoY_%"]) else 0
-                    latest_mom = float(latest_rev["MoM_%"]) if pd.notna(latest_rev["MoM_%"]) else 0
-                    latest_revenue = float(latest_rev["revenue"]) / 100000000
-                    has_revenue = True
-            except Exception:
-                pass
-
-        alerts = {"red": [], "yellow": [], "green": []}
-        rsi_v = safe_get(df['RSI14'])
-        if rsi_v is not None:
-            if rsi_v > 80: alerts["red"].append("RSI 嚴重超買")
-            elif rsi_v > 70: alerts["yellow"].append("RSI 接近超買")
-            elif rsi_v < 30: alerts["green"].append("RSI 超賣可能反彈")
-
-        k_v = safe_get(df['K'])
-        d_v = safe_get(df['D'])
-        if k_v is not None and d_v is not None:
-            if k_v > 80 and d_v > 80: alerts["red"].append("KD 高檔鈍化")
-            elif k_v < 20 and d_v < 20: alerts["green"].append("KD 低檔鈍化")
-            if len(df) >= 2:
-                prev_k = safe_get(df["K"], -2)
-                prev_d = safe_get(df["D"], -2)
-                if prev_k is not None and prev_d is not None:
-                    if k_v < d_v and prev_k > prev_d: alerts["red"].append("KD 死叉")
-                    elif k_v > d_v and prev_k < prev_d: alerts["green"].append("KD 黃金交叉")
-
-        ma5_v = safe_get(df['MA5'])
-        ma20_v = safe_get(df['MA20'])
-        ma60_v = safe_get(df['MA60'])
-        close_v = safe_get(df['close'])
-        if all(v is not None for v in [ma5_v, ma20_v, ma60_v, close_v]):
-            if close_v > ma5_v > ma20_v > ma60_v: alerts["green"].append("均線多頭排列")
-            elif close_v < ma5_v < ma20_v < ma60_v: alerts["red"].append("均線空頭排列")
-
-        vol_ratio = safe_get(df['Volume_Ratio'])
-        if vol_ratio is not None:
-            if vol_ratio > 2: alerts["yellow"].append(f"爆量 ({vol_ratio:.1f}x)")
-            elif vol_ratio < 0.5: alerts["yellow"].append("量縮警示")
-
-        latest_change = safe_get(df['Change_Pct']) or 0
-        if latest_change > 0 and latest_inst_total < 0: alerts["red"].append("籌碼背離")
-        elif latest_change < 0 and latest_inst_total > 0: alerts["green"].append("法人逆勢買進")
-
-        if foreign_days >= 3:
-            if foreign_dir == "買超": alerts["green"].append(f"外資連{foreign_days}買")
-            else: alerts["red"].append(f"外資連{foreign_days}賣")
-
-        if has_revenue:
-            if latest_yoy > 30: alerts["green"].append(f"營收YoY +{latest_yoy:.0f}%")
-            elif latest_yoy > 10: alerts["green"].append(f"營收YoY +{latest_yoy:.0f}%")
-            elif latest_yoy < -10: alerts["red"].append(f"營收YoY {latest_yoy:.0f}%")
-
-        tech_score = 3
-        if rsi_v is not None:
-            if rsi_v > 80 or (k_v is not None and d_v is not None and k_v > 80 and d_v > 80):
-                tech_score = 5
-            elif rsi_v > 70: tech_score = 4
-            elif ma5_v is not None and ma20_v is not None and close_v is not None and close_v > ma5_v > ma20_v:
-                tech_score = 4
-            elif ma20_v is not None and close_v is not None and close_v < ma20_v:
-                tech_score = 2
-
-        chip_score = 3
-        if latest_change > 0 and latest_inst_total < 0: chip_score = 2
-        elif foreign_days >= 3 and foreign_dir == "買超": chip_score = 5
-        elif foreign_days >= 3 and foreign_dir == "賣超": chip_score = 2
-        elif latest_inst_total > 0: chip_score = 4
-
-        if has_revenue:
-            if latest_yoy > 30: fund_score = 5
-            elif latest_yoy > 10: fund_score = 4
-            elif latest_yoy > 0: fund_score = 3
-            elif latest_yoy > -10: fund_score = 2
-            else: fund_score = 1
-        else:
-            fund_score = 3
-
-        if len(alerts["red"]) >= 2: overall_status = "🔴 過熱"
-        elif len(alerts["red"]) >= 1: overall_status = "🟡 觀察"
-        elif len(alerts["green"]) >= 2: overall_status = "🟢 健康"
-        else: overall_status = "⚪ 中性"
-
-        macd_v = safe_get(df['MACD'])
-
-        return {
-            "股票代號": stock_id,
-            "股票名稱": stock_name,
-            "is_etf": is_etf,
-            "has_revenue": has_revenue,
-            "df": df,
-            "pivot": pivot,
-            "收盤價": float(latest["close"]),
-            "漲跌幅": latest_change,
-            "成交量(張)": int(latest["volume"] / 1000),
-            "RSI": round(rsi_v, 2) if rsi_v is not None else None,
-            "K": round(k_v, 2) if k_v is not None else None,
-            "D": round(d_v, 2) if d_v is not None else None,
-            "MACD": round(macd_v, 2) if macd_v is not None else None,
-            "MA5": round(ma5_v, 2) if ma5_v is not None else None,
-            "MA20": round(ma20_v, 2) if ma20_v is not None else None,
-            "MA60": round(ma60_v, 2) if ma60_v is not None else None,
-            "量比": round(vol_ratio, 2) if vol_ratio is not None else None,
-            "外資(張)": latest_foreign,
-            "投信(張)": latest_trust,
-            "自營商(張)": latest_dealer,
-            "法人合計(張)": latest_inst_total,
-            "外資連續": f"{foreign_days}日{foreign_dir}",
-            "最新月營收(億)": round(latest_revenue, 2),
-            "營收YoY(%)": round(latest_yoy, 2),
-            "營收MoM(%)": round(latest_mom, 2),
-            "技術面評分": tech_score,
-            "籌碼面評分": chip_score,
-            "基本面評分": fund_score,
-            "整體狀態": overall_status,
-            "警示_紅": alerts["red"],
-            "警示_黃": alerts["yellow"],
-            "警示_綠": alerts["green"],
-        }
-    except Exception as e:
-        return {"股票代號": stock_id, "錯誤": str(e)}
+    return {
+        "name": name, "id": stock_id, "is_etf": is_etf, "has_rev": has_rev,
+        "df": df, "pivot": pivot,
+        "close": float(lat["close"]), "chg": chg,
+        "vol": int(lat["volume"]/1000),
+        "rsi": rsi_v, "k": k_v, "d": d_v,
+        "ma5": ma5_v, "ma20": ma20_v, "ma60": ma60_v,
+        "macd": safe(df["MACD"]), "macd_sig": safe(df["MACD_sig"]),
+        "vr": vr_v,
+        "ifor": ifor, "itru": itru, "idal": idal, "itot": itot,
+        "fd": fd, "fdir": fdir,
+        "yoy": yoy, "mom": mom, "rev": rev,
+        "ts": ts, "cs": cs, "fs": fs,
+        "status": status,
+        "alerts": alerts,
+        "rev_df": None,
+    }, None
 
 
-def plot_kline(df, stock_name, stock_id):
-    fig = make_subplots(
-        rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.02,
-        row_heights=[0.45, 0.12, 0.14, 0.14, 0.15],
-        subplot_titles=("日 K 線 + 均線", "成交量", "RSI(14)", "MACD(12,26,9)", "KD(9,3,3)")
-    )
-    fig.add_trace(go.Candlestick(
-        x=df["date"], open=df["open"], high=df["high"], low=df["low"], close=df["close"],
-        increasing_line_color="red", decreasing_line_color="green", name="K線"
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["MA5"], name="MA5", line=dict(color="yellow", width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["MA20"], name="MA20", line=dict(color="orange", width=1)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["MA60"], name="MA60", line=dict(color="magenta", width=1)), row=1, col=1)
+def plot_kline(df, name, sid):
+    fig = make_subplots(rows=5, cols=1, shared_xaxes=True, vertical_spacing=0.02,
+        row_heights=[0.44,0.12,0.14,0.15,0.15],
+        subplot_titles=("日K線+均線","成交量","RSI(14)","MACD(12,26,9)","KD(9,3,3)"))
 
-    colors = ["red" if c >= o else "green" for c, o in zip(df["close"], df["open"])]
-    fig.add_trace(go.Bar(x=df["date"], y=df["volume"], marker_color=colors, name="成交量", showlegend=False), row=2, col=1)
+    fig.add_trace(go.Candlestick(x=df["date"], open=df["open"], high=df["high"],
+        low=df["low"], close=df["close"],
+        increasing_line_color="red", decreasing_line_color="green", name="K線"), row=1, col=1)
+    for col, color in [("MA5","yellow"),("MA20","orange"),("MA60","magenta")]:
+        fig.add_trace(go.Scatter(x=df["date"], y=df[col], name=col,
+            line=dict(color=color, width=1)), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=df["date"], y=df["RSI14"], name="RSI", line=dict(color="yellow", width=1.5)), row=3, col=1)
-    fig.add_hline(y=70, line_dash="dash", line_color="red", row=3, col=1)
-    fig.add_hline(y=30, line_dash="dash", line_color="green", row=3, col=1)
+    vc = ["red" if c >= o else "green" for c, o in zip(df["close"], df["open"])]
+    fig.add_trace(go.Bar(x=df["date"], y=df["volume"], marker_color=vc,
+        name="量", showlegend=False), row=2, col=1)
 
-    if "MACD_hist" in df.columns and df["MACD_hist"].notna().any():
-        hist_colors = ["red" if v >= 0 else "green" for v in df["MACD_hist"].fillna(0)]
-        fig.add_trace(go.Bar(x=df["date"], y=df["MACD_hist"], marker_color=hist_colors, name="MACD柱", showlegend=False), row=4, col=1)
-        fig.add_trace(go.Scatter(x=df["date"], y=df["MACD"], name="DIF", line=dict(color="cyan", width=1.5)), row=4, col=1)
-        fig.add_trace(go.Scatter(x=df["date"], y=df["MACD_signal"], name="DEA", line=dict(color="yellow", width=1.5)), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["RSI"], name="RSI",
+        line=dict(color="yellow",width=1.5)), row=3, col=1)
+    for y, c in [(70,"red"),(30,"green")]:
+        fig.add_hline(y=y, line_dash="dash", line_color=c, row=3, col=1)
 
-    fig.add_trace(go.Scatter(x=df["date"], y=df["K"], name="K", line=dict(color="cyan", width=1.5)), row=5, col=1)
-    fig.add_trace(go.Scatter(x=df["date"], y=df["D"], name="D", line=dict(color="magenta", width=1.5)), row=5, col=1)
-    fig.add_hline(y=80, line_dash="dash", line_color="red", row=5, col=1)
-    fig.add_hline(y=20, line_dash="dash", line_color="green", row=5, col=1)
+    if df["MACD_hist"].notna().any():
+        hc = ["red" if v >= 0 else "green" for v in df["MACD_hist"].fillna(0)]
+        fig.add_trace(go.Bar(x=df["date"], y=df["MACD_hist"], marker_color=hc,
+            name="柱", showlegend=False), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df["date"], y=df["MACD"], name="DIF",
+            line=dict(color="cyan",width=1.5)), row=4, col=1)
+        fig.add_trace(go.Scatter(x=df["date"], y=df["MACD_sig"], name="DEA",
+            line=dict(color="orange",width=1.5)), row=4, col=1)
 
-    fig.update_layout(title=f"{stock_name} ({stock_id}) - 技術分析", template="plotly_dark",
-                      height=800, xaxis_rangeslider_visible=False, showlegend=True, hovermode="x unified")
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    fig.add_trace(go.Scatter(x=df["date"], y=df["K"], name="K",
+        line=dict(color="cyan",width=1.5)), row=5, col=1)
+    fig.add_trace(go.Scatter(x=df["date"], y=df["D"], name="D",
+        line=dict(color="magenta",width=1.5)), row=5, col=1)
+    for y, c in [(80,"red"),(20,"green")]:
+        fig.add_hline(y=y, line_dash="dash", line_color=c, row=5, col=1)
+
+    fig.update_layout(title=f"{name}（{sid}）技術分析", template="plotly_dark",
+        height=820, xaxis_rangeslider_visible=False, hovermode="x unified")
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat","mon"])])
     return fig
 
 
-def plot_institutional(pivot, df):
-    if pivot.empty:
-        return None
-    recent = pivot.head(10).sort_index()
-    price_recent = df[df["date"].isin(pd.to_datetime(recent.index))][["date", "close"]]
-    price_recent = price_recent.sort_values("date")
-
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Bar(x=recent.index, y=recent["外資"], name="外資", marker_color="#3b82f6"), secondary_y=False)
-    fig.add_trace(go.Bar(x=recent.index, y=recent["投信"], name="投信", marker_color="#ef4444"), secondary_y=False)
-    fig.add_trace(go.Bar(x=recent.index, y=recent["自營商"], name="自營商", marker_color="#a855f7"), secondary_y=False)
-    fig.add_trace(go.Bar(x=recent.index, y=recent["合計"], name="合計", marker_color="#22c55e"), secondary_y=False)
-    fig.add_trace(go.Scatter(x=price_recent["date"], y=price_recent["close"],
-                             name="股價", mode="lines+markers",
-                             line=dict(color="yellow", width=2), marker=dict(size=8)), secondary_y=True)
+def plot_inst(pivot, df):
+    if pivot.empty: return None
+    rec = pivot.head(10).sort_index()
+    pr  = df[df["date"].isin(pd.to_datetime(rec.index))][["date","close"]].sort_values("date")
+    fig = make_subplots(specs=[[{"secondary_y":True}]])
+    for col, color in [("外資","#3b82f6"),("投信","#ef4444"),("自營商","#a855f7"),("合計","#22c55e")]:
+        fig.add_trace(go.Bar(x=rec.index, y=rec[col], name=col, marker_color=color), secondary_y=False)
+    fig.add_trace(go.Scatter(x=pr["date"], y=pr["close"], name="股價",
+        line=dict(color="yellow",width=2), marker=dict(size=7), mode="lines+markers"), secondary_y=True)
     fig.update_layout(title="三大法人近10日籌碼動向", template="plotly_dark",
-                      barmode="group", height=400, hovermode="x unified")
+        barmode="group", height=380, hovermode="x unified")
     fig.update_yaxes(title_text="法人買賣超(張)", secondary_y=False)
     fig.update_yaxes(title_text="股價(元)", secondary_y=True)
     return fig
 
 
-def render_card(report, note=""):
-    if "錯誤" in report:
-        return f'<div class="status-card"><h4 style="color:#ff6b6b;">❌ {report["股票代號"]}</h4><p style="color:#aaa;">{report["錯誤"]}</p></div>'
+# ══════════════════════════════════════════
+#  主畫面
+# ══════════════════════════════════════════
+st.title("📊 台股個股分析")
 
-    status = report["整體狀態"]
-    if "🔴" in status: status_color, status_bg = "#ff6b6b", "#4a1a1a"
-    elif "🟡" in status: status_color, status_bg = "#ffd93d", "#4a3a1a"
-    elif "🟢" in status: status_color, status_bg = "#6bcf7f", "#1a4a2a"
-    else: status_color, status_bg = "#aaa", "#2a2a2a"
+# ── 唯一輸入框 ──
+col_in, col_btn = st.columns([3, 1])
+with col_in:
+    sid = st.text_input("", placeholder="輸入股票代號，例如 2330、0050、00981A",
+                        label_visibility="collapsed")
+with col_btn:
+    go_btn = st.button("🔍 開始分析", type="primary", use_container_width=True)
 
-    chg = report["漲跌幅"]
-    if chg > 0: chg_html = f'<span style="color:#ff6b6b;">▲ {chg:+.2f}%</span>'
-    elif chg < 0: chg_html = f'<span style="color:#6bcf7f;">▼ {chg:+.2f}%</span>'
-    else: chg_html = '<span style="color:#aaa;">─ 0.00%</span>'
+st.divider()
 
-    alerts_html = ""
-    for a in report["警示_紅"]: alerts_html += f'<span class="alert-red">🔴 {a}</span>'
-    for a in report["警示_黃"]: alerts_html += f'<span class="alert-yellow">🟡 {a}</span>'
-    for a in report["警示_綠"]: alerts_html += f'<span class="alert-green">🟢 {a}</span>'
-    if not alerts_html: alerts_html = '<span style="color:#aaa;">⚪ 無特殊訊號</span>'
+if not (go_btn and sid.strip()):
+    st.markdown("""
+    ### 👋 使用方式
+    1. 在上方輸入框輸入**股票代號**（上市/上櫃/ETF 都可以）
+    2. 按「🔍 開始分析」
+    3. 查看完整的 **技術面 + 籌碼面 + 基本面** 報告
 
-    rsi = report.get("RSI") or "N/A"
-    k = report.get("K") or "N/A"
-    d = report.get("D") or "N/A"
-    foreign = report.get("外資(張)", 0)
-    foreign_color = "#ff6b6b" if foreign > 0 else "#6bcf7f" if foreign < 0 else "#aaa"
+    ---
+    #### 支援的類型
+    | 類型 | 範例 |
+    |------|------|
+    | 上市 | 2330 台積電、2303 聯電、6849 奇鼎 |
+    | 上櫃 | 4573 高明鐵 |
+    | ETF  | 0050、00981A |
+    | 興櫃 | 7731 火星生技（資料可能較少） |
+    """)
+    st.stop()
 
-    yoy = report.get("營收YoY(%)", 0)
-    if report.get("has_revenue"):
-        yoy_color = "#ff6b6b" if yoy > 0 else "#6bcf7f"
-        yoy_str = f'<span style="color:{yoy_color}">{yoy:+.1f}%</span>'
-    else:
-        yoy_str = '<span style="color:#aaa">ETF 無營收</span>'
+sid = sid.strip().upper()
 
-    note_html = f'<p style="color:#888;font-size:11px;margin-top:6px;">📝 {note}</p>' if note else ""
+with st.spinner(f"分析 {sid} 中，請稍候..."):
+    result, err = analyze(sid)
 
-    return f"""
-    <div class="status-card">
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-            <div>
-                <h4 style="margin:0;color:#fff;">{report['股票名稱']} <span style="color:#888;">{report['股票代號']}</span></h4>
-                <p style="margin:4px 0;font-size:18px;font-weight:bold;">{report['收盤價']} {chg_html}</p>
-            </div>
-            <div style="background:{status_bg};color:{status_color};padding:6px 12px;border-radius:6px;font-weight:bold;">{status}</div>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin:12px 0;font-size:12px;">
-            <div style="background:#2a2a2a;padding:6px 10px;border-radius:4px;"><span style="color:#aaa;">RSI</span><span style="float:right;font-weight:500;">{rsi}</span></div>
-            <div style="background:#2a2a2a;padding:6px 10px;border-radius:4px;"><span style="color:#aaa;">KD</span><span style="float:right;font-weight:500;">{k}/{d}</span></div>
-            <div style="background:#2a2a2a;padding:6px 10px;border-radius:4px;"><span style="color:#aaa;">外資(張)</span><span style="float:right;color:{foreign_color};font-weight:500;">{foreign:+,}</span></div>
-            <div style="background:#2a2a2a;padding:6px 10px;border-radius:4px;"><span style="color:#aaa;">營收YoY</span><span style="float:right;font-weight:500;">{yoy_str}</span></div>
-        </div>
-        <div style="font-size:11px;color:#aaa;margin-bottom:8px;">技術 {report['技術面評分']}/5 ⭐ | 籌碼 {report['籌碼面評分']}/5 ⭐ | 基本面 {report['基本面評分']}/5 ⭐</div>
-        <div>{alerts_html}</div>
-        {note_html}
-    </div>
-    """
+if err or result is None:
+    st.error(f"❌ {err or '分析失敗，請確認股票代號正確'}")
+    st.stop()
 
+r = result
+df = r["df"]
 
-def main():
-    st.title("📊 台股觀察清單分析")
-    st.caption(f"⏰ 最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+# ── 標題列 ──
+chg_color = "#ff6b6b" if r["chg"] >= 0 else "#6bcf7f"
+chg_arrow = "▲" if r["chg"] >= 0 else "▼"
+st.markdown(f"""
+<h2 style="margin-bottom:4px;">{r['name']} <span style="color:#888;font-size:18px;">{r['id']}</span>
+&nbsp;&nbsp;
+<span style="color:{chg_color};font-size:24px;">{r['close']:.2f}
+&nbsp;{chg_arrow} {abs(r['chg']):.2f}%</span>
+&nbsp;&nbsp;
+<span style="font-size:16px;color:#888;">{r['status']}</span>
+</h2>
+<p style="color:#888;font-size:13px;">成交量：{r['vol']:,} 張 &nbsp;|&nbsp; 最後更新：{datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+""", unsafe_allow_html=True)
 
-    if "watchlist_data" not in st.session_state:
-        st.session_state.watchlist_data = load_watchlist()
-    if "all_reports" not in st.session_state:
-        st.session_state.all_reports = []
+# ── 警示標籤 ──
+alerts_html = ""
+for a in r["alerts"]["red"]: alerts_html += f'<span class="alert-red">🔴 {a}</span> '
+for a in r["alerts"]["yellow"]: alerts_html += f'<span class="alert-yellow">🟡 {a}</span> '
+for a in r["alerts"]["green"]: alerts_html += f'<span class="alert-green">🟢 {a}</span> '
+if alerts_html:
+    st.markdown(alerts_html, unsafe_allow_html=True)
 
-    with st.sidebar:
-        st.header("⚙️ 操作面板")
-        if st.button("🔄 全部分析", type="primary", use_container_width=True):
-            stocks = st.session_state.watchlist_data["stocks"]
-            progress = st.progress(0, "準備分析...")
-            reports = []
-            for i, s in enumerate(stocks):
-                progress.progress((i + 1) / len(stocks), f"分析 {s['name']} ({s['id']})...")
-                r = analyze_stock(s["id"])
-                r["備註"] = s.get("note", "")
-                reports.append(r)
-                time.sleep(0.3)
-            st.session_state.all_reports = reports
-            progress.empty()
-            st.success(f"✅ 完成 {len(reports)} 檔分析")
+st.divider()
 
-        st.divider()
-        st.subheader("➕ 新增股票")
-        new_id = st.text_input("代號", placeholder="例: 2330")
-        new_name = st.text_input("名稱", placeholder="例: 台積電")
-        new_note = st.text_input("備註", placeholder="例: 庫存")
-        if st.button("加入清單", use_container_width=True):
-            if new_id and new_name:
-                st.session_state.watchlist_data["stocks"].append({
-                    "id": new_id, "name": new_name, "note": new_note
-                })
-                st.success(f"已加入 {new_name}")
-            else:
-                st.error("請填寫代號和名稱")
+# ── 指標速覽（一排 6 格）──
+c1,c2,c3,c4,c5,c6 = st.columns(6)
+c1.metric("RSI(14)", f"{r['rsi']:.1f}" if r['rsi'] else "N/A",
+    "⚠ 超買" if r['rsi'] and r['rsi']>80 else "🟢 超賣" if r['rsi'] and r['rsi']<30 else "")
+c2.metric("K / D", f"{r['k']:.0f} / {r['d']:.0f}" if r['k'] and r['d'] else "N/A")
+c3.metric("MACD", f"{r['macd']:.2f}" if r['macd'] else "N/A")
+c4.metric("MA5 / MA20", f"{r['ma5']:.1f} / {r['ma20']:.1f}" if r['ma5'] and r['ma20'] else "N/A")
+c5.metric("量比", f"{r['vr']:.2f}x" if r['vr'] else "N/A",
+    "⚡ 爆量" if r['vr'] and r['vr']>2 else "")
+c6.metric("評分 技/籌/基", f"{r['ts']}/5 · {r['cs']}/5 · {r['fs']}/5")
 
-        st.divider()
-        st.subheader("🗑️ 移除股票")
-        stocks = st.session_state.watchlist_data["stocks"]
-        if stocks:
-            options = [f"{s['id']} - {s['name']}" for s in stocks]
-            to_remove = st.selectbox("選擇要移除的", options)
-            if st.button("確認移除", use_container_width=True):
-                idx = options.index(to_remove)
-                removed = st.session_state.watchlist_data["stocks"].pop(idx)
-                st.success(f"已移除 {removed['name']}")
+st.divider()
 
-        st.divider()
-        if st.session_state.all_reports:
-            st.subheader("📥 匯出 Excel")
-            export_data = []
-            for r in st.session_state.all_reports:
-                if "錯誤" not in r:
-                    export_data.append({
-                        "代號": r["股票代號"], "名稱": r["股票名稱"], "備註": r.get("備註", ""),
-                        "狀態": r["整體狀態"], "收盤": r["收盤價"], "漲跌%": r["漲跌幅"],
-                        "RSI": r["RSI"], "K": r["K"], "D": r["D"],
-                        "外資(張)": r["外資(張)"], "投信(張)": r["投信(張)"],
-                        "營收YoY%": r["營收YoY(%)"],
-                        "技術評分": r["技術面評分"], "籌碼評分": r["籌碼面評分"], "基本面評分": r["基本面評分"],
-                        "紅色警示": " | ".join(r["警示_紅"]),
-                        "綠色正面": " | ".join(r["警示_綠"]),
-                    })
-            if export_data:
-                df_export = pd.DataFrame(export_data)
-                buffer = io.BytesIO()
-                with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                    df_export.to_excel(writer, index=False, sheet_name="觀察清單")
-                st.download_button(
-                    label="📥 下載 Excel", data=buffer.getvalue(),
-                    file_name=f"觀察清單_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+# ── 法人速覽 ──
+ca,cb,cc,cd = st.columns(4)
+ca.metric("外資(張)", f"{r['ifor']:+,}", f"{r['fd']}日{r['fdir']}")
+cb.metric("投信(張)", f"{r['itru']:+,}")
+cc.metric("自營商(張)", f"{r['idal']:+,}")
+cd.metric("法人合計(張)", f"{r['itot']:+,}")
 
-    if not st.session_state.all_reports:
-        st.info("👈 請點擊左側「🔄 全部分析」開始")
-        st.subheader("📋 目前觀察清單")
-        for s in st.session_state.watchlist_data["stocks"]:
-            note = f" - {s['note']}" if s.get("note") else ""
-            st.write(f"• **{s['name']}** ({s['id']}){note}")
-        return
+if r["has_rev"]:
+    st.divider()
+    ce,cf,cg = st.columns(3)
+    ce.metric("最新月營收(億)", f"{r['rev']:.2f}")
+    cf.metric("YoY", f"{r['yoy']:+.1f}%",
+        "🟢" if r['yoy']>10 else "🔴" if r['yoy']<-10 else "")
+    cg.metric("MoM", f"{r['mom']:+.1f}%",
+        "🟢" if r['mom']>5 else "🔴" if r['mom']<-5 else "")
 
-    valid_reports = [r for r in st.session_state.all_reports if "錯誤" not in r]
-    red_count = sum(1 for r in valid_reports if "🔴" in r["整體狀態"])
-    yellow_count = sum(1 for r in valid_reports if "🟡" in r["整體狀態"])
-    green_count = sum(1 for r in valid_reports if "🟢" in r["整體狀態"])
-    gray_count = sum(1 for r in valid_reports if "⚪" in r["整體狀態"])
+st.divider()
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("📊 總數", len(valid_reports))
-    col2.metric("🔴 過熱", red_count)
-    col3.metric("🟡 觀察", yellow_count)
-    col4.metric("🟢 健康", green_count)
-    col5.metric("⚪ 中性", gray_count)
+# ── 圖表 ──
+st.plotly_chart(plot_kline(df, r["name"], r["id"]), use_container_width=True)
 
-    if red_count > 0 or yellow_count > 0:
-        with st.expander("⚠️ 今日警示彙整", expanded=True):
-            for r in valid_reports:
-                if r["警示_紅"]:
-                    st.error(f"**{r['股票名稱']} ({r['股票代號']})**：{' | '.join(r['警示_紅'])}")
-                elif r["警示_黃"]:
-                    st.warning(f"**{r['股票名稱']} ({r['股票代號']})**：{' | '.join(r['警示_黃'])}")
+if not r["pivot"].empty:
+    fig_inst = plot_inst(r["pivot"], df)
+    if fig_inst:
+        st.plotly_chart(fig_inst, use_container_width=True)
 
-    tab1, tab2, tab3 = st.tabs(["🎴 卡片總覽", "📊 詳細表格", "📈 單檔分析"])
+    st.subheader("💼 三大法人近10日明細（張）")
+    st.dataframe(r["pivot"].head(10), use_container_width=True)
 
-    with tab1:
-        cols = st.columns(2)
-        for i, r in enumerate(st.session_state.all_reports):
-            with cols[i % 2]:
-                st.markdown(render_card(r, r.get("備註", "")), unsafe_allow_html=True)
-                st.markdown("<br>", unsafe_allow_html=True)
-
-    with tab2:
-        table_data = []
-        for r in valid_reports:
-            table_data.append({
-                "代號": r["股票代號"], "名稱": r["股票名稱"], "狀態": r["整體狀態"],
-                "收盤": r["收盤價"], "漲跌%": f"{r['漲跌幅']:+.2f}",
-                "RSI": r["RSI"],
-                "K/D": f"{r['K']}/{r['D']}" if r["K"] and r["D"] else "N/A",
-                "外資(張)": f"{r['外資(張)']:+,}",
-                "營收YoY%": f"{r['營收YoY(%)']:+.1f}%" if r["has_revenue"] else "N/A",
-                "技/籌/基": f"{r['技術面評分']}/{r['籌碼面評分']}/{r['基本面評分']}",
-                "警示": " | ".join(r["警示_紅"][:2]) if r["警示_紅"] else "—",
-            })
-        df_table = pd.DataFrame(table_data)
-        st.dataframe(df_table, use_container_width=True, hide_index=True)
-
-    with tab3:
-        if valid_reports:
-            options = [f"{r['股票名稱']} ({r['股票代號']})" for r in valid_reports]
-            selected = st.selectbox("選擇股票", options)
-            idx = options.index(selected)
-            r = valid_reports[idx]
-
-            st.subheader(f"{r['股票名稱']} ({r['股票代號']})")
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("收盤價", r["收盤價"], f"{r['漲跌幅']:+.2f}%")
-            c2.metric("RSI", r["RSI"] or "N/A")
-            c3.metric("外資(張)", f"{r['外資(張)']:+,}")
-            c4.metric("整體狀態", r["整體狀態"])
-
-            if "df" in r and not r["df"].empty:
-                st.plotly_chart(plot_kline(r["df"], r["股票名稱"], r["股票代號"]), use_container_width=True)
-
-            if "pivot" in r and not r["pivot"].empty:
-                inst_fig = plot_institutional(r["pivot"], r["df"])
-                if inst_fig:
-                    st.plotly_chart(inst_fig, use_container_width=True)
-                st.subheader("💼 三大法人近10日明細 (張)")
-                st.dataframe(r["pivot"].head(10), use_container_width=True)
-
-
-if __name__ == "__main__":
-    main()
+st.caption(f"⚠️ 本分析僅供參考，不代表投資建議。操作前請依個人資金控管與風險承受度判斷。")
